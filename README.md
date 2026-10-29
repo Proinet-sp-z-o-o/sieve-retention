@@ -144,6 +144,7 @@ allow that) or loop over a user list in a root cron job.
 ```
 inbox-retention-expunge.py --user USER [--mailbox MAILBOX] [--header HEADER]
                             [--execute] [--log PATH]
+                            [--incremental --state PATH]
 ```
 
 | Flag | Default | Meaning |
@@ -153,6 +154,39 @@ inbox-retention-expunge.py --user USER [--mailbox MAILBOX] [--header HEADER]
 | `--header` | `X-Retention-After` | header carrying the retention window, in days |
 | `--execute` | off | actually expunge; omit for a dry run |
 | `--log PATH` | stdout | append log lines here instead |
+| `--incremental` | off | only rescan UIDs at/above the last run's watermark - see below |
+| `--state PATH` | *(required with `--incremental`)* | JSON file holding the watermark; one file per (user, mailbox, header) |
+
+### `--incremental`: skipping the already-resolved history
+
+On a mailbox that's accumulated years of history, re-running the full
+`header X-Retention-After ""` search every day re-examines mail that was
+already expunged or was never tagged in the first place - pure overhead
+that grows with total mailbox size, not with how much there is left to do.
+
+IMAP UIDs are strictly increasing within a mailbox: a newly delivered
+message always gets a higher UID than anything already there, independent
+of its `Date:` header. That means after a full sweep, the lowest UID among
+messages that are *still* tagged and not yet expired is a safe watermark -
+nothing below it can still be pending, so the next run only needs to
+search UIDs from that watermark upward (`uid WATERMARK:*`). `--incremental`
+persists that watermark (plus the mailbox's `UIDVALIDITY`, to detect
+whether the watermark is still trustworthy) to `--state PATH` and uses it
+on the next run.
+
+Caveat: this assumes `X-Retention-After` is only ever added going forward,
+at delivery time. If you ever backfill the header onto *old* mail already
+below a saved watermark - e.g. by hand, or via `sieve-filter -e`, the way
+this project's authors originally cleaned up an existing backlog - delete
+the state file (or just omit `--incremental` for one run) to force a full
+rescan; otherwise that backfilled mail is invisible to the script. A
+changed `UIDVALIDITY` (rare - happens after certain mailbox repairs) is
+detected automatically and also forces a full rescan.
+
+A dry run (no `--execute`) still updates the watermark for mail with no
+pending tagged messages below it, but never advances past anything it
+would have expunged - so alternating dry runs and `--execute` runs stays
+safe.
 
 ## How age is computed
 

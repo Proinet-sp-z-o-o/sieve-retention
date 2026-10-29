@@ -36,6 +36,7 @@ self-service doveadm - see README). Python 3, stdlib only.
 """
 import argparse
 import datetime as dt
+import json
 import re
 import subprocess
 import sys
@@ -58,33 +59,81 @@ def exact_values(user, mailbox, header, uids):
     return values
 
 
-def sweep(user, mailbox, header, execute, log):
-    out = doveadm("search", "-u", user, "mailbox", mailbox, "header", header, "")
+def mailbox_status(user, mailbox):
+    """(uidvalidity, uidnext) for mailbox - uidnext is the UID the next
+    delivered message will get, i.e. a safe upper bound for "nothing here
+    yet, but anything from here on is new"."""
+    out = doveadm("mailbox", "status", "-u", user, "uidvalidity uidnext", mailbox)
+    fields = {k: int(v) for k, v in re.findall(r"(\w+)=(\d+)", out)}
+    return fields["uidvalidity"], fields["uidnext"]
+
+
+def load_state(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_state(path, state):
+    with open(path, "w") as f:
+        json.dump(state, f)
+
+
+def sweep(user, mailbox, header, execute, log, incremental=False, state_path=None):
+    watermark = 1
+    current_uidvalidity = uidnext = None
+    if incremental:
+        current_uidvalidity, uidnext = mailbox_status(user, mailbox)
+        state = load_state(state_path)
+        if state.get("uidvalidity") == current_uidvalidity:
+            watermark = state.get("watermark_uid", 1)
+        elif state:
+            log(f"{user}/{mailbox}: uidvalidity changed ({state.get('uidvalidity')} -> "
+                f"{current_uidvalidity}), forcing a full rescan this run")
+
+    search_args = ["search", "-u", user, "mailbox", mailbox, "header", header, ""]
+    if incremental and watermark > 1:
+        # Everything below the watermark was already resolved (expunged, or
+        # never tagged) as of the last run - only UIDs from here up can
+        # still be pending or newly arrived.
+        search_args += ["uid", f"{watermark}:*"]
+    out = doveadm(*search_args)
     uids = [u for u in out.split() if u.isdigit()]
-    if not uids:
-        return
 
-    values = exact_values(user, mailbox, header, uids)
-    by_value = {}
-    for uid, v in values.items():
-        by_value.setdefault(v, []).append(uid)
+    expunged = set()
+    if uids:
+        values = exact_values(user, mailbox, header, uids)
+        by_value = {}
+        for uid, v in values.items():
+            by_value.setdefault(v, []).append(uid)
 
-    for value, group_uids in by_value.items():
-        if not re.fullmatch(r"\d+", value):
-            log(f"{user}/{mailbox}: ignoring non-numeric {header}={value!r} on uids {group_uids}")
-            continue
-        days = int(value)
-        uidset = ",".join(group_uids)
-        out = doveadm("search", "-u", user, "mailbox", mailbox, "uid", uidset, "sentbefore", f"{days}d")
-        aged_uids = [u for u in out.split() if u.isdigit()]
-        if not aged_uids:
-            continue
-        aged_set = ",".join(aged_uids)
-        if execute:
-            doveadm("expunge", "-u", user, "mailbox", mailbox, "uid", aged_set)
-            log(f"{user}/{mailbox}: expunged {len(aged_uids)} uids (retention={days}d): {aged_uids}")
-        else:
-            log(f"{user}/{mailbox}: would expunge {len(aged_uids)} uids (retention={days}d): {aged_uids}")
+        for value, group_uids in by_value.items():
+            if not re.fullmatch(r"\d+", value):
+                log(f"{user}/{mailbox}: ignoring non-numeric {header}={value!r} on uids {group_uids}")
+                continue
+            days = int(value)
+            uidset = ",".join(group_uids)
+            out = doveadm("search", "-u", user, "mailbox", mailbox, "uid", uidset, "sentbefore", f"{days}d")
+            aged_uids = [u for u in out.split() if u.isdigit()]
+            if not aged_uids:
+                continue
+            aged_set = ",".join(aged_uids)
+            if execute:
+                doveadm("expunge", "-u", user, "mailbox", mailbox, "uid", aged_set)
+                log(f"{user}/{mailbox}: expunged {len(aged_uids)} uids (retention={days}d): {aged_uids}")
+                expunged.update(aged_uids)
+            else:
+                log(f"{user}/{mailbox}: would expunge {len(aged_uids)} uids (retention={days}d): {aged_uids}")
+
+    if incremental:
+        # Dry runs never actually remove anything, so nothing may be
+        # dropped from the pending set, or a later --execute run would
+        # silently skip messages that are already overdue today.
+        still_pending = (set(uids) - expunged) if execute else set(uids)
+        new_watermark = min(int(u) for u in still_pending) if still_pending else uidnext
+        save_state(state_path, {"uidvalidity": current_uidvalidity, "watermark_uid": new_watermark})
 
 
 def main():
@@ -96,7 +145,16 @@ def main():
     p.add_argument("--execute", action="store_true",
                    help="actually expunge; without this, only prints what would be expunged")
     p.add_argument("--log", help="append log lines to this file instead of stdout")
+    p.add_argument("--incremental", action="store_true",
+                   help="only rescan UIDs at or above the last run's watermark instead of the "
+                        "whole mailbox (requires --state); see README for the UID-monotonicity "
+                        "assumption this relies on")
+    p.add_argument("--state", help="JSON file to persist the incremental watermark in "
+                                    "(required with --incremental, one file per user+mailbox+header)")
     args = p.parse_args()
+
+    if args.incremental and not args.state:
+        p.error("--incremental requires --state PATH")
 
     if args.log:
         def log(msg):
@@ -106,7 +164,8 @@ def main():
         def log(msg):
             print(msg)
 
-    sweep(args.user, args.mailbox, args.header, args.execute, log)
+    sweep(args.user, args.mailbox, args.header, args.execute, log,
+          incremental=args.incremental, state_path=args.state)
 
 
 if __name__ == "__main__":
