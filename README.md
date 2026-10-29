@@ -3,6 +3,9 @@
 Self-expiring mail for Dovecot/Sieve, without ever moving the message out of
 your INBOX first.
 
+Built and sponsored by [Proinet sp. z o.o.](https://www.proinet.pl) —
+[Michał Mosiewicz](mailto:mimo@proinet.pl).
+
 ## The problem
 
 "Some mail is only relevant for a while, then it can be deleted" sounds like
@@ -174,6 +177,14 @@ search term.
   net, point your `X-Retention-After` rules at Trash-adjacent handling by
   having Sieve `fileinto "Trash"` for genuinely unwanted mail, and reserve
   this tool for mail you're comfortable permanently losing once it expires.
+
+## Credits
+
+Built and open-sourced by [Proinet sp. z o.o.](https://www.proinet.pl)
+([Michał Mosiewicz](mailto:mimo@proinet.pl)), sponsored as part of our own
+infrastructure work - we hit this exact gap running our own mail, found
+nothing that solved it, and figured it was worth sharing rather than keeping
+in-house.
 
 ## License
 
